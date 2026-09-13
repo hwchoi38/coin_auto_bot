@@ -1,0 +1,14 @@
+# API 키와 개인 설정은 GitHub에 올리지 않습니다.
+.env
+
+# 가상환경은 각 PC에서 새로 만듭니다.
+.venv/
+
+# 실행 로그와 모의계좌 상태는 PC별로 관리합니다.
+logs/
+data/
+*.log
+
+# Python이 자동 생성하는 파일입니다.
+__pycache__/
+*.py[cod]

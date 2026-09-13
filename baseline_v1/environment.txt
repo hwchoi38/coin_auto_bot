@@ -1,0 +1,24 @@
+﻿Python 3.14.6
+beautifulsoup4==4.15.0
+bs4==0.0.2
+certifi==2026.5.20
+charset-normalizer==3.4.7
+DateTime==6.0
+html5lib==1.1
+idna==3.18
+numpy==2.4.6
+pandas==3.0.3
+pybithumb==1.0.21
+PyJWT==2.13.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+pytz==2026.2
+requests==2.34.2
+six==1.17.0
+soupsieve==2.8.4
+typing_extensions==4.15.0
+tzdata==2026.2
+urllib3==2.7.0
+webencodings==0.5.1
+websockets==16.0
+zope.interface==8.5
