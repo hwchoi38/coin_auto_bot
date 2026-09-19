@@ -2,6 +2,7 @@
 
 import os
 import time
+from io import StringIO
 
 import pandas as pd
 import requests
@@ -56,6 +57,13 @@ WARMUP_DAYS = max(
 # 이 CSV는 매매 판단에는 사용하지 않는 관찰용 결과입니다.
 MEAN_REVERSION_EVENT_FILE = (
     "data/mean_reversion_events.csv"
+)
+
+# ECB 기준환율 API입니다. EUR 대비 USD·KRW 환율을 이용해
+# 원·달러(KRW/USD) 기준환율을 계산합니다.
+ECB_EXCHANGE_RATE_URL = (
+    "https://data-api.ecb.europa.eu/service/data/"
+    "EXR/D.{currency}.EUR.SP00.A"
 )
 
 
@@ -155,6 +163,81 @@ def fetch_daily_candles(
     return df
 
 
+def fetch_usd_krw_rates(
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    """ECB 기준환율로 일별 원·달러 환율을 계산합니다."""
+
+    exchange_rates: dict[str, pd.Series] = {}
+
+    for currency in ("USD", "KRW"):
+        try:
+            response = requests.get(
+                ECB_EXCHANGE_RATE_URL.format(
+                    currency=currency,
+                ),
+                params={
+                    "startPeriod": start_date.strftime(
+                        "%Y-%m-%d"
+                    ),
+                    "endPeriod": end_date.strftime(
+                        "%Y-%m-%d"
+                    ),
+                    "format": "csvdata",
+                },
+                timeout=20,
+            )
+
+            response.raise_for_status()
+            rate_df = pd.read_csv(
+                StringIO(response.text)
+            )
+
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as error:
+            raise RuntimeError(
+                f"ECB {currency} 기준환율 조회에 실패했습니다: "
+                f"{error}"
+            ) from error
+
+        if rate_df.empty or {
+            "TIME_PERIOD",
+            "OBS_VALUE",
+        }.difference(rate_df.columns):
+            raise RuntimeError(
+                f"ECB {currency} 기준환율 데이터가 비어 있습니다."
+            )
+
+        rate_df["date"] = pd.to_datetime(
+            rate_df["TIME_PERIOD"]
+        )
+
+        exchange_rates[currency] = pd.Series(
+            rate_df["OBS_VALUE"].astype(float).to_numpy(),
+            index=rate_df["date"],
+            name=currency,
+        )
+
+    rate_df = pd.concat(
+        [
+            exchange_rates["USD"].rename("usd_per_eur"),
+            exchange_rates["KRW"].rename("krw_per_eur"),
+        ],
+        axis=1,
+    ).dropna()
+
+    # ECB는 EUR당 통화 단위를 제공하므로 나누면 KRW/USD가 됩니다.
+    rate_df["usd_krw_rate"] = (
+        rate_df["krw_per_eur"]
+        / rate_df["usd_per_eur"]
+    )
+
+    return rate_df[["usd_krw_rate"]]
+
+
 def load_price_data() -> pd.DataFrame:
     """지표 계산용 데이터와 실제 테스트 데이터를 반환합니다."""
 
@@ -187,6 +270,36 @@ def load_price_data() -> pd.DataFrame:
 
     # 오늘 진행 중인 일봉은 제외합니다.
     df = df[df.index < today].copy()
+
+    # 기준환율은 발표 시점 차이로 미래 정보가 섞이지 않게
+    # 직전 이용 가능 영업일 값을 사용합니다.
+    usd_krw_df = fetch_usd_krw_rates(
+        start_date=df.index.min() - pd.Timedelta(days=7),
+        end_date=df.index.max(),
+    )
+
+    # ECB 기준환율은 발표일 다음 날부터 사용할 수 있다고 가정합니다.
+    # 발표 시점 차이로 미래 정보가 섞이지 않도록 날짜를 하루 뒤로 이동합니다.
+    usd_krw_df = usd_krw_df.copy()
+    usd_krw_df.index = (
+        usd_krw_df.index + pd.Timedelta(days=1)
+    )
+
+    df = df.join(usd_krw_df, how="left")
+
+    # 주말·휴일에는 가장 최근 영업일의 기준환율을 유지합니다.
+    df["usd_krw_rate"] = df["usd_krw_rate"].ffill()
+
+    # 환율 데이터가 정말 없으면 기간을 조용히 바꾸지 않고 오류를 냅니다.
+    if df["usd_krw_rate"].isna().any():
+        raise RuntimeError(
+            "원·달러 기준환율을 연결하지 못한 일봉이 있습니다."
+        )
+
+    # 빗썸 USDT/KRW가 기준환율 대비 얼마나 비싼지·싼지 계산합니다.
+    df["premium_pct"] = (
+        df["close"] / df["usd_krw_rate"] - 1
+    ) * 100
 
     print(
         f"수집된 일봉     : {len(df):,}개"
@@ -642,12 +755,34 @@ def analyze_mean_reversion_events(
 
     strategy = MovingAverageStrategy()
     prices: list[float] = []
+    premium_values: list[float] = []
     indicators: list[dict] = []
 
     # 백테스트와 같은 순서로 지표를 계산해 미래 정보를 쓰지 않습니다.
     for current_date, row in calculation_df.iterrows():
         prices.append(float(row["close"]))
+        premium_values.append(float(row["premium_pct"]))
         signal_result = strategy.generate_signal(prices)
+
+        # 기존 가격 Z-score와 별도로, 환율 대비 괴리율의 Z-score를 계산합니다.
+        # 이 값은 아직 매매 신호에 사용하지 않는 관찰용 지표입니다.
+        premium_z_score = None
+
+        if len(premium_values) >= MEAN_PERIOD:
+            premium_window = premium_values[-MEAN_PERIOD:]
+            premium_mean = (
+                sum(premium_window) / MEAN_PERIOD
+            )
+            premium_variance = sum(
+                (value - premium_mean) ** 2
+                for value in premium_window
+            ) / MEAN_PERIOD
+            premium_std = premium_variance ** 0.5
+
+            if premium_std != 0:
+                premium_z_score = (
+                    premium_values[-1] - premium_mean
+                ) / premium_std
 
         trend_pct = None
 
@@ -706,6 +841,11 @@ def analyze_mean_reversion_events(
                 "low": float(row["low"]),
                 "z_score": signal_result["z_score"],
                 "trend_pct": trend_pct,
+
+                # 원·달러 기준환율 대비 빗썸 USDT/KRW 괴리율 관찰값입니다.
+                "usd_krw_rate": float(row["usd_krw_rate"]),
+                "premium_pct": float(row["premium_pct"]),
+                "premium_z_score": premium_z_score,
 
                 # 아래 세 값은 매매 판단에는 사용하지 않는 관찰용 데이터입니다.
                 "recent_3d_return_pct": recent_3d_return_pct,
@@ -788,6 +928,9 @@ def analyze_mean_reversion_events(
             "entry_z": z_score,
             "entry_trend_pct": trend_pct,
             "trend_group": trend_group,
+            "usd_krw_rate": row["usd_krw_rate"],
+            "premium_pct": row["premium_pct"],
+            "premium_z_score": row["premium_z_score"],
             "recovery_days": recovery_days,
             "recovered_within_30d": not recovered.empty,
             "max_drawdown_30d_pct": (
@@ -810,6 +953,175 @@ def analyze_mean_reversion_events(
 
     return pd.DataFrame(event_rows)
 
+
+def analyze_premium_events(calculation_df, analysis_df) -> pd.DataFrame:
+    """
+    환율 대비 프리미엄의 평균회귀 성질만 관찰합니다.
+    기존 매매 규칙이나 가격 Z-score 이벤트 분석은 변경하지 않습니다.
+    """
+    premium_entry_z_score = -1.5  # 관찰용 사전 기준값
+    horizon_days = 30
+
+    indicators = calculation_df.copy()
+
+    # 프리미엄 자체의 최근 평균과 표준편차를 계산합니다.
+    indicators["premium_mean"] = (
+        indicators["premium_pct"]
+        .rolling(MEAN_PERIOD)
+        .mean()
+    )
+    indicators["premium_std"] = (
+        indicators["premium_pct"]
+        .rolling(MEAN_PERIOD)
+        .std(ddof=0)
+    )
+
+    indicators["premium_z_score"] = (
+        (indicators["premium_pct"] - indicators["premium_mean"])
+        / indicators["premium_std"]
+    )
+
+    # 분석 구간에 필요한 지표를 붙입니다.
+    analysis_df = analysis_df.copy()
+    analysis_df = analysis_df.join(
+        indicators[["premium_z_score"]],
+        how="left",
+    )
+
+    events = []
+    waiting_for_recovery = False
+
+    # 미래 30일 성과를 계산할 수 있는 사건만 사용합니다.
+    for i in range(len(analysis_df) - horizon_days):
+        row = analysis_df.iloc[i]
+
+        if pd.isna(row["premium_z_score"]):
+            continue
+
+        # 한 번 사건이 발생하면 프리미엄 Z-score가 0 이상이 될 때까지
+        # 같은 하락 구간을 중복 집계하지 않습니다.
+        if waiting_for_recovery:
+            if row["premium_z_score"] >= 0:
+                waiting_for_recovery = False
+            continue
+
+        # 프리미엄이 평소보다 충분히 낮은 날을 사건으로 기록합니다.
+        if row["premium_z_score"] > premium_entry_z_score:
+            continue
+
+        future_rows = analysis_df.iloc[i + 1:i + 1 + horizon_days]
+
+        # 30일 안에 프리미엄이 평균 수준(Z-score 0 이상)으로
+        # 회복한 첫 시점을 찾습니다.
+        recovered_rows = future_rows[
+            future_rows["premium_z_score"] >= 0
+        ]
+
+        if recovered_rows.empty:
+            recovery_days = None
+            recovered_within_30d = False
+        else:
+            first_recovery_index = recovered_rows.index[0]
+            recovery_days = (
+                analysis_df.index.get_loc(first_recovery_index) - i
+            )
+            recovered_within_30d = True
+
+        event = {
+            "event_date": analysis_df.index[i].date(),
+            "entry_price": row["close"],
+            "entry_premium_pct": row["premium_pct"],
+            "entry_premium_z_score": row["premium_z_score"],
+            "recovery_days": recovery_days,
+            "recovered_within_30d": recovered_within_30d,
+
+            # 사건 뒤 USDT/KRW 가격이 얼마나 더 내려갔는지 확인합니다.
+            "max_price_drawdown_30d_pct": (
+                (future_rows["low"].min() / row["close"]) - 1
+            ) * 100,
+        }
+
+        # 프리미엄 변화는 수익률이 아니라 %p(퍼센트포인트)입니다.
+        for days in [3, 7, 14, 30]:
+            future_premium = future_rows.iloc[days - 1]["premium_pct"]
+
+            event[f"premium_change_{days}d_pct_point"] = (
+                future_premium - row["premium_pct"]
+            )
+
+            # 프리미엄 회복 중 실제 USDT 가격이 어떻게 움직였는지도 기록합니다.
+            future_close = future_rows.iloc[days - 1]["close"]
+
+            event[f"price_return_{days}d_pct"] = (
+                (future_close / row["close"]) - 1
+            ) * 100
+
+        events.append(event)
+
+        # 이번 사건이 평균으로 회복될 때까지 다음 사건을 막습니다.
+        waiting_for_recovery = True
+
+    events_df = pd.DataFrame(events)
+
+    os.makedirs("data", exist_ok=True)
+    events_df.to_csv(
+        "data/premium_reversion_events_development.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    return events_df
+
+def print_premium_report(events_df: pd.DataFrame) -> None:
+    """개발 구간의 프리미엄 평균회귀 관찰 결과를 출력합니다."""
+    print("\n================================")
+    print("[프리미엄 평균회귀 관찰 - 개발 구간]")
+    print("================================")
+
+    if events_df.empty:
+        print("관찰 사건이 없습니다.")
+        return
+
+    recovery_rate = (
+        events_df["recovered_within_30d"].mean() * 100
+    )
+
+    summary = pd.DataFrame(
+        [{
+            "사건수": len(events_df),
+            "3일후 중앙값(%p)": (
+                events_df["premium_change_3d_pct_point"].median()
+            ),
+            "7일후 중앙값(%p)": (
+                events_df["premium_change_7d_pct_point"].median()
+            ),
+            "14일후 중앙값(%p)": (
+                events_df["premium_change_14d_pct_point"].median()
+            ),
+            "30일후 중앙값(%p)": (
+                events_df["premium_change_30d_pct_point"].median()
+            ),
+            "최저 가격낙폭 중앙값(%)": (
+                events_df["max_price_drawdown_30d_pct"].median()
+            ),
+            "최악 가격낙폭(%)": (
+                events_df["max_price_drawdown_30d_pct"].min()
+            ),
+            "평균 회복일": (
+                events_df["recovery_days"].mean()
+            ),
+            "30일내 회복률(%)": recovery_rate,
+            "30일내 미회복": (
+                (~events_df["recovered_within_30d"]).sum()
+            ),
+        }]
+    )
+
+    print(summary.to_string(index=False))
+    print(
+        "\n프리미엄 사건 CSV: "
+        "data/premium_reversion_events_development.csv"
+    )
 
 def print_mean_reversion_report(
     events: pd.DataFrame,
@@ -1104,6 +1416,15 @@ def main() -> None:
         f"\n평균회귀 사건 CSV: "
         f"{MEAN_REVERSION_EVENT_FILE}"
     )
+
+    # 프리미엄 가설은 개발 구간 70%에서만 먼저 관찰합니다.
+    # 검증·최종 시험 구간을 미리 보지 않아 과최적화를 막습니다.
+    premium_events = analyze_premium_events(
+        development_df,
+        development_df,
+    )
+
+    print_premium_report(premium_events)
 
 
 if __name__ == "__main__":
