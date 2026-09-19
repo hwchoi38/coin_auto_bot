@@ -15,11 +15,14 @@ BITHUMB_HOURLY_CANDLE_URL = (
 MARKET = "KRW-USDT"
 HOUR_UNIT = 60
 
-# 첫 수집은 최근 90일만 확인합니다.
-# 데이터 형식·누락·중복이 정상인 것을 확인한 뒤 기간을 늘립니다.
-RESEARCH_DAYS = 90
+# 일봉 연구와 같은 약 3년 범위를 확보합니다.
+# 시간봉 규칙은 아직 바꾸지 않습니다.
+RESEARCH_DAYS = 365 * 3
 
 OUTPUT_FILE = "data/hourly_usdt_krw.csv"
+
+DEVELOPMENT_RATIO = 0.70
+VALIDATION_RATIO = 0.15
 
 
 def fetch_hourly_candles() -> pd.DataFrame:
@@ -103,7 +106,7 @@ def analyze_hourly_reversion(df: pd.DataFrame) -> pd.DataFrame:
     entry_z_score = -1.5
     horizon_hours = 24
 
-    indicators = df.copy()
+    indicators = df.asfreq("h").copy()
 
     # 최근 24시간 가격을 기준으로 평균과 표준편차를 계산합니다.
     indicators["mean"] = (
@@ -145,9 +148,13 @@ def analyze_hourly_reversion(df: pd.DataFrame) -> pd.DataFrame:
             i + 1:i + 1 + horizon_hours
         ]
 
+        if future_rows[["close", "low"]].isna().any().any():
+            continue
+
         recovered_rows = future_rows[
             future_rows["z_score"] >= 0
         ]
+
 
         if recovered_rows.empty:
             recovery_hours = None
@@ -160,6 +167,9 @@ def analyze_hourly_reversion(df: pd.DataFrame) -> pd.DataFrame:
 
         event = {
             "event_datetime": indicators.index[i],
+            "observation_end_datetime": indicators.index[
+                i + horizon_hours
+            ],
             "entry_price": row["close"],
             "entry_z_score": row["z_score"],
             "recovery_hours": recovery_hours,
@@ -211,44 +221,135 @@ def main() -> None:
         end=df.index.max(),
         freq="h",
     )
-    missing_count = len(expected_index.difference(df.index))
+    # 시간봉 사이의 누락 시각을 확인합니다.
+    missing_hours = expected_index.difference(df.index)
+    missing_count = len(missing_hours)
 
     print(f"누락 시간봉   : {missing_count:,}개")
 
-        # 시간봉 평균회귀 사건을 관찰용으로만 분석합니다.
-    events_df = analyze_hourly_reversion(df)
+    # 누락이 있으면 정확한 시각을 별도 CSV로 저장합니다.
+    # 이후 분석에서 데이터 공백이 특정 기간에 몰렸는지 확인합니다.
+    if missing_count > 0:
+        missing_df = pd.DataFrame(
+            {"missing_datetime": missing_hours}
+        )
 
-    print("\n[시간봉 평균회귀 관찰]")
+        missing_df.to_csv(
+            "data/hourly_missing_candles.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+        print(
+            "누락 목록     : "
+            "data/hourly_missing_candles.csv"
+        )
+    # 전체 시간 순서 기준으로 개발 70%, 검증 15%, 최종 시험 15%를 나눕니다.
+    total_count = len(df)
+    development_end_position = int(total_count * DEVELOPMENT_RATIO)
+    validation_end_position = int(
+        total_count * (DEVELOPMENT_RATIO + VALIDATION_RATIO)
+    )
+
+    # 개발 구간이 끝나는 시각입니다.
+    validation_start_datetime = df.index[
+        development_end_position
+    ]
+
+    # 최종 시험 구간 시작 시각입니다.
+    # 이 시각 이후 데이터는 아직 사건 분석에 사용하지 않습니다.
+    test_start_datetime = df.index[
+        validation_end_position
+    ]
+
+    # 개발 + 검증(앞 85%)만 분석합니다.
+    # 최종 시험 15%는 아직 보지 않는다는 원칙을 지킵니다.
+    development_validation_df = df.iloc[
+        :validation_end_position
+    ]
+
+    events_df = analyze_hourly_reversion(
+        development_validation_df
+    )
+
+    print("\n[시간봉 평균회귀 개발·검증 관찰]")
+    print(
+        "개발 구간     : "
+        f"{df.index.min():%Y-%m-%d %H:%M} ~ "
+        f"{validation_start_datetime:%Y-%m-%d %H:%M}"
+    )
+    print(
+        "검증 구간     : "
+        f"{validation_start_datetime:%Y-%m-%d %H:%M} ~ "
+        f"{test_start_datetime:%Y-%m-%d %H:%M}"
+    )
+    print("최종 시험 구간: 아직 확인하지 않음")
 
     if events_df.empty:
         print("24시간 뒤까지 확인 가능한 사건이 없습니다.")
         return
 
-    print(f"사건 수        : {len(events_df)}")
+    # 개발 구간 종료 전까지 24시간 관찰이 끝난 사건만 사용합니다.
+    development_events = events_df[
+        events_df["observation_end_datetime"]
+        < validation_start_datetime
+    ]
+
+        # 검증 구간에서 시작하고 검증 구간 안에서 24시간 관찰까지 끝난 사건만 사용합니다.
+    validation_events = events_df[
+        (events_df["event_datetime"] >= validation_start_datetime)
+        & (
+            events_df["observation_end_datetime"]
+            < test_start_datetime
+        )
+    ]
+
+    # 개발·검증 통계를 같은 기준으로 출력합니다.
+    for segment_name, segment_events in [
+        ("개발", development_events),
+        ("검증", validation_events),
+    ]:
+        print(f"\n[{segment_name} 구간]")
+
+        if segment_events.empty:
+            print("관찰 가능한 사건이 없습니다.")
+            continue
+
+        print(f"사건 수              : {len(segment_events)}")
+
+        for hours in [1, 3, 6, 12, 24]:
+            median_return = segment_events[
+                f"return_{hours}h_pct"
+            ].median()
+
+            print(
+                f"{hours:>2}시간 수익 중앙값    : "
+                f"{median_return:.3f}%"
+            )
+
+        print(
+            "24시간 낙폭 중앙값    : "
+            f"{segment_events['max_drawdown_24h_pct'].median():.3f}%"
+        )
+        print(
+            "최악 낙폭             : "
+            f"{segment_events['max_drawdown_24h_pct'].min():.3f}%"
+        )
+        print(
+            "-3% 초과 낙폭 건수    : "
+            f"{(segment_events['max_drawdown_24h_pct'] < -3.0).sum()}건"
+        )
+        print(
+            "24시간 내 회복률      : "
+            f"{segment_events['recovered_within_24h'].mean() * 100:.2f}%"
+        )
+
     print(
-        "3시간 수익 중앙값: "
-        f"{events_df['return_3h_pct'].median():.3f}%"
-    )
-    print(
-        "24시간 수익 중앙값: "
-        f"{events_df['return_24h_pct'].median():.3f}%"
-    )
-    print(
-        "최저 낙폭 중앙값: "
-        f"{events_df['max_drawdown_24h_pct'].median():.3f}%"
-    )
-    print(
-        "최악 낙폭      : "
-        f"{events_df['max_drawdown_24h_pct'].min():.3f}%"
-    )
-    print(
-        "24시간 내 회복률: "
-        f"{events_df['recovered_within_24h'].mean() * 100:.2f}%"
-    )
-    print(
-        "사건 CSV       : "
+        "\n사건 CSV       : "
         "data/hourly_reversion_events.csv"
     )
+        
+    
 
 
 if __name__ == "__main__":
