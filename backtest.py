@@ -954,7 +954,14 @@ def analyze_mean_reversion_events(
     return pd.DataFrame(event_rows)
 
 
-def analyze_premium_events(calculation_df, analysis_df) -> pd.DataFrame:
+def analyze_premium_events(
+    calculation_df,
+    analysis_df,
+    require_absolute_discount: bool = False,
+    output_file: str = (
+        "data/premium_reversion_events_development.csv"
+    ),
+) -> pd.DataFrame:
     """
     환율 대비 프리미엄의 평균회귀 성질만 관찰합니다.
     기존 매매 규칙이나 가격 Z-score 이벤트 분석은 변경하지 않습니다.
@@ -1005,8 +1012,13 @@ def analyze_premium_events(calculation_df, analysis_df) -> pd.DataFrame:
                 waiting_for_recovery = False
             continue
 
-        # 프리미엄이 평소보다 충분히 낮은 날을 사건으로 기록합니다.
+        # 프리미엄이 최근 평균보다 충분히 낮은 날만 사건으로 기록합니다.
         if row["premium_z_score"] > premium_entry_z_score:
+            continue
+
+        # 후보 규칙:
+        # 환율 기준가보다 실제 USDT/KRW 가격이 낮은 절대 할인 상태만 허용합니다.
+        if require_absolute_discount and row["premium_pct"] >= 0:
             continue
 
         future_rows = analysis_df.iloc[i + 1:i + 1 + horizon_days]
@@ -1064,8 +1076,9 @@ def analyze_premium_events(calculation_df, analysis_df) -> pd.DataFrame:
     events_df = pd.DataFrame(events)
 
     os.makedirs("data", exist_ok=True)
+    # 호출한 구간별로 별도 CSV 파일을 저장합니다.
     events_df.to_csv(
-        "data/premium_reversion_events_development.csv",
+        output_file,
         index=False,
         encoding="utf-8-sig",
     )
@@ -1101,6 +1114,19 @@ def print_premium_report(events_df: pd.DataFrame) -> None:
             "30일후 중앙값(%p)": (
                 events_df["premium_change_30d_pct_point"].median()
             ),
+            # 프리미엄 회복과 별개로 실제 USDT/KRW 가격 성과를 확인합니다.
+            "3일 가격수익 중앙값(%)": (
+                events_df["price_return_3d_pct"].median()
+            ),
+            "7일 가격수익 중앙값(%)": (
+                events_df["price_return_7d_pct"].median()
+            ),
+            "30일 가격수익 중앙값(%)": (
+                events_df["price_return_30d_pct"].median()
+            ),
+            "-3% 초과 낙폭": (
+                events_df["max_price_drawdown_30d_pct"] <= -3
+            ).sum(),
             "최저 가격낙폭 중앙값(%)": (
                 events_df["max_price_drawdown_30d_pct"].median()
             ),
@@ -1425,6 +1451,46 @@ def main() -> None:
     )
 
     print_premium_report(premium_events)
+
+    # ====================================================
+    # 절대 할인 후보 규칙 검증
+    # 조건을 개발 구간에서 고정한 뒤 검증 구간에 그대로 적용합니다.
+    # ====================================================
+
+    # 개발 구간: 후보가 발견된 구간의 기록을 별도 보관합니다.
+    discount_development_events = analyze_premium_events(
+        development_df,
+        development_df,
+        require_absolute_discount=True,
+        output_file=(
+            "data/premium_absolute_discount_development.csv"
+        ),
+    )
+
+    print("\n================================")
+    print("[절대 할인 후보 - 개발 구간]")
+    print("================================")
+    print_premium_report(discount_development_events)
+
+    # 검증 구간에서는 해당 구간 종료일까지만 지표를 계산합니다.
+    # 최종 시험 구간의 미래 정보는 사용하지 않습니다.
+    validation_calculation_df = calculation_df[
+        calculation_df.index <= validation_df.index[-1]
+    ].copy()
+
+    discount_validation_events = analyze_premium_events(
+        validation_calculation_df,
+        validation_df,
+        require_absolute_discount=True,
+        output_file=(
+            "data/premium_absolute_discount_validation.csv"
+        ),
+    )
+
+    print("\n================================")
+    print("[절대 할인 후보 - 검증 구간]")
+    print("================================")
+    print_premium_report(discount_validation_events)
 
 
 if __name__ == "__main__":
