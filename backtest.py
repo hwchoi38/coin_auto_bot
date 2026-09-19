@@ -8,6 +8,7 @@ import requests
 
 from config.settings import (
     BUY_RATIO,
+    ENTRY_Z_SCORE,
     FEE_RATE,
     FORCE_EXIT_DAYS,
     INITIAL_CASH,
@@ -50,6 +51,12 @@ WARMUP_DAYS = max(
     LONG_MA_PERIOD,
     TREND_PERIOD + TREND_LOOKBACK,
 ) + 1
+
+# 평균회귀 특성 분석 결과를 저장할 경로입니다.
+# 이 CSV는 매매 판단에는 사용하지 않는 관찰용 결과입니다.
+MEAN_REVERSION_EVENT_FILE = (
+    "data/mean_reversion_events.csv"
+)
 
 
 def fetch_daily_candles(
@@ -627,6 +634,257 @@ def print_trade_details(
     print(detail.to_string(index=False))
 
 
+def analyze_mean_reversion_events(
+    calculation_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """낮은 Z-score 사건의 이후 회복 특성을 관찰합니다."""
+
+    strategy = MovingAverageStrategy()
+    prices: list[float] = []
+    indicators: list[dict] = []
+
+    # 백테스트와 같은 순서로 지표를 계산해 미래 정보를 쓰지 않습니다.
+    for current_date, row in calculation_df.iterrows():
+        prices.append(float(row["close"]))
+        signal_result = strategy.generate_signal(prices)
+
+        trend_pct = None
+
+        if len(prices) >= TREND_PERIOD + TREND_LOOKBACK:
+            current_ma = sum(prices[-TREND_PERIOD:]) / TREND_PERIOD
+            previous_ma = (
+                sum(
+                    prices[
+                        -(TREND_PERIOD + TREND_LOOKBACK):
+                        -TREND_LOOKBACK
+                    ]
+                )
+                / TREND_PERIOD
+            )
+
+            if previous_ma != 0:
+                trend_pct = (current_ma / previous_ma - 1) * 100
+
+                # 현재 종가와 3거래일 전 종가를 비교합니다.
+        # 저점 진입 직전에도 하락이 이어졌는지 확인하는 관찰용 값입니다.
+        recent_3d_return_pct = None
+
+        if len(prices) >= 4:
+            recent_3d_return_pct = (
+                prices[-1] / prices[-4] - 1
+            ) * 100
+
+        # 현재 종가와 7거래일 전 종가를 비교합니다.
+        # 단기 하락 추세가 지속 중인지 확인하는 관찰용 값입니다.
+        recent_7d_return_pct = None
+
+        if len(prices) >= 8:
+            recent_7d_return_pct = (
+                prices[-1] / prices[-8] - 1
+            ) * 100
+
+        # 최근 7일 종가의 최고·최저 차이입니다.
+        # 값이 클수록 최근 가격 변동이 큰 불안정 구간으로 볼 수 있습니다.
+        recent_7d_range_pct = None
+
+        if len(prices) >= 7:
+            recent_prices = prices[-7:]
+            lowest_recent_price = min(recent_prices)
+
+            if lowest_recent_price != 0:
+                recent_7d_range_pct = (
+                    max(recent_prices)
+                    / lowest_recent_price
+                    - 1
+                ) * 100
+
+        indicators.append(
+            {
+                "date": current_date,
+                "close": float(row["close"]),
+                "low": float(row["low"]),
+                "z_score": signal_result["z_score"],
+                "trend_pct": trend_pct,
+
+                # 아래 세 값은 매매 판단에는 사용하지 않는 관찰용 데이터입니다.
+                "recent_3d_return_pct": recent_3d_return_pct,
+                "recent_7d_return_pct": recent_7d_return_pct,
+                "recent_7d_range_pct": recent_7d_range_pct,
+            }
+        )
+
+    indicator_df = pd.DataFrame(indicators).set_index("date")
+    test_start_date = test_df.index[0]
+    test_end_date = test_df.index[-1]
+    event_rows: list[dict] = []
+
+    # 저점 사건이 발생한 뒤 평균(Z-score 0 이상)으로 회복할 때까지
+    # 같은 하락 국면에서 새 사건을 만들지 않기 위한 상태값입니다.
+    waiting_for_recovery = False
+
+    for index, (current_date, row) in enumerate(
+        indicator_df.iterrows()
+    ):
+        z_score = row["z_score"]
+
+        # 워밍업 구간은 지표 계산에만 사용하고, 사건 분석에는 포함하지 않습니다.
+        if current_date < test_start_date:
+            continue
+
+        # Z-score가 0 이상이면 이전 저점 사건이 평균으로 회복한 것으로 봅니다.
+        # 이후 다시 Z-score가 낮아지면 새로운 독립 사건으로 기록할 수 있습니다.
+        if z_score is not None and z_score >= 0:
+            waiting_for_recovery = False
+
+        is_low = (
+            z_score is not None
+            and z_score <= ENTRY_Z_SCORE
+        )
+
+        # 저점이 아니거나, 이전 저점이 아직 회복되지 않았다면 새 사건을 기록하지 않습니다.
+        if not is_low or waiting_for_recovery:
+            continue
+
+        # 이번 저점을 새로운 사건으로 기록한 뒤,
+        # 평균으로 회복할 때까지 다음 저점 신호를 무시합니다.
+        waiting_for_recovery = True
+
+        # 30일 뒤까지 확인 가능한 사건만 분석합니다.
+        if current_date + pd.Timedelta(days=30) > test_end_date:
+            continue
+
+        future_rows = indicator_df.iloc[index + 1:index + 31]
+
+        if len(future_rows) < 30:
+            continue
+
+        # 진입 종가 이후 30일 동안의 최저 일봉 저가입니다.
+        lowest_price = future_rows["low"].min()
+
+        trend_pct = row["trend_pct"]
+
+        if trend_pct is None or pd.isna(trend_pct):
+            trend_group = "추세 계산 불가"
+        elif trend_pct > 0:
+            trend_group = "상승·횡보"
+        else:
+            trend_group = "하락"
+
+        # 회복은 Z-score가 0 이상으로 돌아온 첫 날로 정의합니다.
+        recovered = future_rows[
+            future_rows["z_score"] >= 0
+        ]
+
+        recovery_days = (
+            (recovered.index[0] - current_date).days
+            if not recovered.empty
+            else None
+        )
+
+        event = {
+            "event_date": current_date,
+            "entry_price": row["close"],
+            "entry_z": z_score,
+            "entry_trend_pct": trend_pct,
+            "trend_group": trend_group,
+            "recovery_days": recovery_days,
+            "recovered_within_30d": not recovered.empty,
+            "max_drawdown_30d_pct": (
+                lowest_price / row["close"] - 1
+            ) * 100,
+
+            # 진입 전에 확인 가능한 단기 가격 상태를 CSV에 저장합니다.
+            "recent_3d_return_pct": row["recent_3d_return_pct"],
+            "recent_7d_return_pct": row["recent_7d_return_pct"],
+            "recent_7d_range_pct": row["recent_7d_range_pct"],
+        }
+
+        for days in (3, 7, 14, 30):
+            future_price = future_rows.iloc[days - 1]["close"]
+            event[f"return_{days}d_pct"] = (
+                future_price / row["close"] - 1
+            ) * 100
+
+        event_rows.append(event)
+
+    return pd.DataFrame(event_rows)
+
+
+def print_mean_reversion_report(
+    events: pd.DataFrame,
+) -> None:
+    """추세별 평균회귀 사건의 수익률과 회복 기간을 출력합니다."""
+
+    print("\n[평균회귀 특성 관찰]")
+
+    if events.empty:
+        print("30일 뒤까지 확인 가능한 저점 사건이 없습니다.")
+        return
+
+    report = (
+        events.groupby("trend_group")
+        .agg(
+            사건수=("event_date", "size"),
+            **{
+                "3일후 평균": ("return_3d_pct", "mean"),
+                "7일후 평균": ("return_7d_pct", "mean"),
+                "14일후 평균": ("return_14d_pct", "mean"),
+                "30일후 평균": ("return_30d_pct", "mean"),
+
+                # 평균보다 극단적인 수익 사건의 영향을 덜 받는 기준입니다.
+                "30일후 중앙값": ("return_30d_pct", "median"),
+
+                # 각 사건에서 평균적으로 얼마나 더 하락했는지 확인합니다.
+                "최저 낙폭 중앙값": (
+                    "max_drawdown_30d_pct",
+                    "median",
+                ),
+
+                # 저위험 전략에서 특히 중요한 최악의 추가 하락입니다.
+                "최악 낙폭": (
+                    "max_drawdown_30d_pct",
+                    "min",
+                ),
+
+                "평균 회복일": ("recovery_days", "mean"),
+                "30일내 회복률": (
+                    "recovered_within_30d",
+                    "mean",
+                ),
+
+                # True는 회복, False는 미회복이므로 False 건수를 셉니다.
+                "30일내 미회복": (
+                    "recovered_within_30d",
+                    lambda values: int((~values).sum()),
+                ),
+            },
+        )
+        .reset_index()
+    )
+
+    report["30일내 회복률"] *= 100
+
+    for column in (
+        "3일후 평균",
+        "7일후 평균",
+        "14일후 평균",
+        "30일후 평균",
+        "30일후 중앙값",
+        "최저 낙폭 중앙값",
+        "최악 낙폭",
+        "평균 회복일",
+        "30일내 회복률",
+     ):
+        report[column] = report[column].map(
+            lambda value: f"{value:.2f}"
+            if pd.notna(value)
+            else "-"
+        )
+
+    print(report.to_string(index=False))
+
+
 def print_result(result: dict) -> None:
     """백테스트 결과를 출력합니다."""
 
@@ -782,6 +1040,70 @@ def main() -> None:
     )
 
     print_result(result)
+
+    # ====================================================
+    # 시간 순서 70% / 15% / 15% 구간 검증
+    # ====================================================
+    # 전략 설정값은 바꾸지 않고, 같은 규칙이 각 시기에도 유지되는지 확인합니다.
+    total_count = len(test_df)
+
+    development_end = int(total_count * 0.70)
+    validation_end = int(total_count * 0.85)
+
+    development_df = test_df.iloc[:development_end].copy()
+    validation_df = test_df.iloc[
+        development_end:validation_end
+    ].copy()
+    final_test_df = test_df.iloc[validation_end:].copy()
+
+    test_segments = [
+        ("개발 구간 70%", development_df),
+        ("검증 구간 15%", validation_df),
+        ("최종 시험 구간 15%", final_test_df),
+    ]
+
+    for segment_name, segment_test_df in test_segments:
+        # 해당 구간 종료일 이후의 데이터는 제거합니다.
+        # 미래 데이터를 보지 않도록 지표 계산용 데이터도 여기까지 제한합니다.
+        segment_calculation_df = calculation_df[
+            calculation_df.index <= segment_test_df.index[-1]
+        ].copy()
+
+        segment_result = run_backtest(
+            segment_calculation_df,
+            segment_test_df,
+        )
+
+        print("\n================================")
+        print(f"[{segment_name}]")
+        print("================================")
+
+        print_result(segment_result)
+
+    # 실제 매수 여부와 무관한 저점 사건을 별도로 분석합니다.
+    # 따라서 아래 분석은 기존 백테스트 매매 결과에 영향을 주지 않습니다.
+    events = analyze_mean_reversion_events(
+        calculation_df,
+        test_df,
+    )
+
+    os.makedirs(
+        os.path.dirname(MEAN_REVERSION_EVENT_FILE),
+        exist_ok=True,
+    )
+
+    events.to_csv(
+        MEAN_REVERSION_EVENT_FILE,
+        index=False,
+        encoding="utf-8-sig",
+        date_format="%Y-%m-%d",
+    )
+
+    print_mean_reversion_report(events)
+    print(
+        f"\n평균회귀 사건 CSV: "
+        f"{MEAN_REVERSION_EVENT_FILE}"
+    )
 
 
 if __name__ == "__main__":
